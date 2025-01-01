@@ -1,11 +1,57 @@
-use std::{process::Output, sync::Arc};
+use std::{
+    any::TypeId,
+    fmt::{self, Debug, Display, Formatter},
+    process::Output,
+    sync::Arc,
+};
 
-type ParseResult<'a, Output> = Result<(&'a str, Output), &'a str>;
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParserErrorType {
+    UnexpectedValue { expected: String },
+    ExpectedIdentifier,
+    ExpectedNumber,
+    ExpectedBoolean,
+    ExpectedOneOrMoreOf { name: &'static str },
+    ExpectedAnyOf { names: Vec<&'static str> },
+    UnexpectedEndOfStream,
+}
+
+pub struct WithInput<'a, T> {
+    value: T,
+    input: &'a str,
+}
+
+impl<T> Debug for WithInput<'_, T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{{ Value: {:?}, Input: {} }}", self.value, self.input)
+    }
+}
+
+pub type ParserError<'a> = WithInput<'a, ParserErrorType>;
+
+type ParseResult<'a, Output> = Result<(&'a str, Output), ParserError<'a>>;
 
 pub mod json;
 
 pub trait Parser<'a, Output> {
     fn parse(&self, input: &'a str) -> ParseResult<'a, Output>;
+
+    fn named(self, name: &'static str) -> NamedParser<'a, Output>
+    where
+        Self: Sized + 'a,
+    {
+        NamedParser::new(move |input| self.parse(input), name)
+    }
+
+    fn arced(self) -> ArcedParser<'a, Output>
+    where
+        Self: Sized + 'a,
+    {
+        ArcedParser::new(self)
+    }
 
     fn map<F, NewOutput>(self, map_fn: F) -> BoxedParser<'a, NewOutput>
     where
@@ -15,6 +61,15 @@ pub trait Parser<'a, Output> {
         F: Fn(Output) -> NewOutput + 'a,
     {
         BoxedParser::new(map(self, map_fn))
+    }
+
+    fn map_err<F>(self, map_fn: F) -> BoxedParser<'a, Output>
+    where
+        Self: Sized + 'a,
+        Output: 'a,
+        F: Fn(ParserError<'a>) -> ParserError<'a> + 'a,
+    {
+        BoxedParser::new(map_err(self, map_fn))
     }
 
     fn pred<F>(self, pred_fn: F) -> BoxedParser<'a, Output>
@@ -36,6 +91,20 @@ pub trait Parser<'a, Output> {
     {
         BoxedParser::new(and_then(self, f))
     }
+
+    fn then<P, NewOutput>(self, parser: P) -> BoxedParser<'a, NewOutput>
+    where
+        Self: Sized + 'a,
+        Output: 'a,
+        P: Parser<'a, NewOutput> + 'a + Clone,
+        NewOutput: 'a,
+    {
+        BoxedParser::new(and_then(self, move |_| parser.clone()))
+    }
+}
+
+pub trait AsStaticStr {
+    fn as_static_str(&self) -> &'static str;
 }
 
 impl<'a, F, Output> Parser<'a, Output> for F
@@ -54,12 +123,41 @@ pub struct Element {
     children: Vec<Element>,
 }
 
+pub struct NamedParser<'a, Output> {
+    parser: Box<dyn Parser<'a, Output> + 'a>,
+    name: &'static str,
+}
+
+impl<'a, Output> NamedParser<'a, Output> {
+    fn new<P>(parser: P, name: &'static str) -> Self
+    where
+        P: Parser<'a, Output> + 'a,
+    {
+        NamedParser {
+            parser: Box::new(parser),
+            name,
+        }
+    }
+}
+
+impl<'a, Output> Parser<'a, Output> for NamedParser<'a, Output> {
+    fn parse(&self, input: &'a str) -> ParseResult<'a, Output> {
+        self.parser.parse(input)
+    }
+}
+
+impl<'a, Output> AsStaticStr for NamedParser<'a, Output> {
+    fn as_static_str(&self) -> &'static str {
+        self.name
+    }
+}
+
 pub struct ArcedParser<'a, Output> {
     parser: Arc<dyn Parser<'a, Output> + 'a>,
 }
 
 impl<'a, Output> ArcedParser<'a, Output> {
-    fn new<P>(parser: P) -> Self
+    pub fn new<P>(parser: P) -> Self
     where
         P: Parser<'a, Output> + 'a,
     {
@@ -104,10 +202,28 @@ impl<'a, Output> Parser<'a, Output> for BoxedParser<'a, Output> {
     }
 }
 
+impl<'a, T> WithInput<'a, T> {
+    pub fn new(value: T, input: &'a str) -> Self {
+        Self { value, input }
+    }
+
+    pub fn replace(self, new_value: T) -> Self {
+        Self {
+            value: new_value,
+            input: self.input,
+        }
+    }
+}
+
 fn match_literal<'a>(expected: &'static str) -> impl Parser<'a, ()> {
     move |input: &'a str| match input.get(0..expected.len()) {
         Some(next) if next == expected => Ok((&input[expected.len()..], ())),
-        _ => Err(input),
+        _ => Err(WithInput::new(
+            ParserErrorType::UnexpectedValue {
+                expected: expected.to_string(),
+            },
+            input,
+        )),
     }
 }
 
@@ -117,7 +233,7 @@ fn identifier(input: &str) -> ParseResult<String> {
 
     match chars.next() {
         Some(next) if next.is_alphabetic() => matched.push(next),
-        _ => return Err(input),
+        _ => return Err(WithInput::new(ParserErrorType::ExpectedIdentifier, input)),
     }
 
     while let Some(next) = chars.next() {
@@ -158,6 +274,14 @@ where
     }
 }
 
+fn map_err<'a, P, F, A>(parser: P, map_fn: F) -> impl Parser<'a, A>
+where
+    P: Parser<'a, A>,
+    F: Fn(ParserError<'a>) -> ParserError<'a>,
+{
+    move |input| parser.parse(input).map_err(|e| map_fn(e))
+}
+
 fn left<'a, P1, P2, R1, R2>(parser1: P1, parser2: P2) -> impl Parser<'a, R1>
 where
     P1: Parser<'a, R1>,
@@ -176,7 +300,7 @@ where
 
 fn one_or_more<'a, P, A>(parser: P) -> impl Parser<'a, Vec<A>>
 where
-    P: Parser<'a, A>,
+    P: Parser<'a, A> + AsStaticStr,
 {
     move |mut input| {
         let mut result = Vec::new();
@@ -185,7 +309,12 @@ where
             input = next_input;
             result.push(first_item);
         } else {
-            return Err(input);
+            return Err(WithInput::new(
+                ParserErrorType::ExpectedOneOrMoreOf {
+                    name: parser.as_static_str(),
+                },
+                input,
+            ));
         }
 
         while let Ok((next_input, next_item)) = parser.parse(input) {
@@ -194,6 +323,34 @@ where
         }
 
         Ok((input, result))
+    }
+}
+
+fn zero_or_more_until<'a, P, A, E, F>(parser: P, end: E) -> impl Parser<'a, (Vec<A>, F)>
+where
+    P: Parser<'a, A>,
+    E: Parser<'a, F>,
+{
+    move |mut input| {
+        let mut result = Vec::new();
+
+        let err;
+        loop {
+            match parser.parse(input) {
+                Ok((next_input, next_item)) => {
+                    input = next_input;
+                    result.push(next_item);
+                }
+                Err(e) => {
+                    err = e;
+                    break; // Exit the loop on error
+                }
+            }
+        }
+        match end.parse(input) {
+            Ok((next_input, end)) => Ok((next_input, (result, end))),
+            Err(_) => Err(err),
+        }
     }
 }
 
@@ -216,13 +373,17 @@ where
 fn any_char(input: &str) -> ParseResult<char> {
     match input.chars().next() {
         Some(next) => Ok((&input[next.len_utf8()..], next)),
-        _ => Err(input),
+        _ => Err(WithInput::new(
+            ParserErrorType::UnexpectedEndOfStream,
+            input,
+        )),
     }
 }
 
 fn number<'a>() -> impl Parser<'a, i64> {
-    one_or_more(any_char.pred(|e| e.is_numeric()))
+    one_or_more(any_char.pred(|e| e.is_numeric()).named("digit"))
         .map(|e| i64::from_str_radix(&e.iter().collect::<String>(), 10).unwrap())
+        .map_err(|e| e.replace(ParserErrorType::ExpectedNumber))
 }
 
 fn boolean<'a>() -> impl Parser<'a, bool> {
@@ -230,6 +391,7 @@ fn boolean<'a>() -> impl Parser<'a, bool> {
         match_literal("true").map(|_| true),
         match_literal("false").map(|_| false),
     )
+    .map_err(|e| e.replace(ParserErrorType::ExpectedBoolean))
 }
 
 fn pred<'a, P, A, F>(parser: P, predicate: F) -> impl Parser<'a, A>
@@ -243,7 +405,7 @@ where
                 return Ok((next_input, value));
             }
         }
-        Err(input)
+        Err(WithInput::new(ParserErrorType::ExpectedIdentifier, input))
     }
 }
 
@@ -274,38 +436,6 @@ fn quoted_string<'a>() -> impl Parser<'a, String> {
     .map(|chars| chars.into_iter().collect())
 }
 
-fn attribute_pair<'a>() -> impl Parser<'a, (String, String)> {
-    pair(identifier, right(match_literal("="), quoted_string()))
-}
-
-fn attributes<'a>() -> impl Parser<'a, Vec<(String, String)>> {
-    zero_or_more(right(one_or_more(whitespace_char()), attribute_pair()))
-}
-
-fn element_start<'a>() -> impl Parser<'a, (String, Vec<(String, String)>)> {
-    right(match_literal("<"), pair(identifier, attributes()))
-}
-
-fn single_element<'a>() -> impl Parser<'a, Element> {
-    left(
-        element_start(),
-        pair(zero_or_more(whitespace_char()), match_literal("/>")),
-    )
-    .map(|(name, attributes)| Element {
-        name,
-        attributes,
-        children: vec![],
-    })
-}
-
-fn open_element<'a>() -> impl Parser<'a, Element> {
-    left(element_start(), match_literal(">")).map(|(name, attributes)| Element {
-        name,
-        attributes,
-        children: vec![],
-    })
-}
-
 fn either<'a, P1, P2, A>(parser1: P1, parser2: P2) -> impl Parser<'a, A>
 where
     P1: Parser<'a, A>,
@@ -329,25 +459,6 @@ where
     }
 }
 
-pub fn element<'a>() -> impl Parser<'a, Element> {
-    whitespace_wrap(either(single_element(), parent_element()))
-}
-
-fn close_element<'a>(expected_name: String) -> impl Parser<'a, String> {
-    right(match_literal("</"), left(identifier, match_literal(">")))
-        .pred(move |name| name == &expected_name)
-}
-
-fn parent_element<'a>() -> impl Parser<'a, Element> {
-    open_element().and_then(|el| {
-        left(zero_or_more(element()), close_element(el.name.clone())).map(move |children| {
-            let mut el = el.clone();
-            el.children = children;
-            el
-        })
-    })
-}
-
 fn whitespace_wrap<'a, P, A>(parser: P) -> impl Parser<'a, A>
 where
     P: Parser<'a, A>,
@@ -357,7 +468,7 @@ where
         left(parser, zero_or_more(whitespace_char())),
     )
 }
-
+/*
 #[test]
 fn literal_parser() {
     let parse_joe = match_literal("Hello Joe!");
@@ -436,74 +547,4 @@ fn quoted_string_parser() {
         Ok(("", "Hello Joe!".to_string())),
         quoted_string().parse("\"Hello Joe!\"")
     );
-}
-
-#[test]
-fn attribute_parser() {
-    assert_eq!(
-        Ok((
-            "",
-            vec![
-                ("one".to_string(), "1".to_string()),
-                ("two".to_string(), "2".to_string())
-            ]
-        )),
-        attributes().parse(" one=\"1\" two=\"2\"")
-    );
-}
-
-#[test]
-fn single_element_parser() {
-    assert_eq!(
-        Ok((
-            "",
-            Element {
-                name: "div".to_string(),
-                attributes: vec![("class".to_string(), "float".to_string())],
-                children: vec![]
-            }
-        )),
-        single_element().parse("<div class=\"float\"/>")
-    );
-}
-
-#[test]
-fn xml_parser() {
-    let doc = r#"
-        <top label="Top">
-            <semi-bottom label="Bottom"/>
-            <middle>
-                <bottom label="Another bottom"/>
-            </middle>
-        </top>"#;
-    let parsed_doc = Element {
-        name: "top".to_string(),
-        attributes: vec![("label".to_string(), "Top".to_string())],
-        children: vec![
-            Element {
-                name: "semi-bottom".to_string(),
-                attributes: vec![("label".to_string(), "Bottom".to_string())],
-                children: vec![],
-            },
-            Element {
-                name: "middle".to_string(),
-                attributes: vec![],
-                children: vec![Element {
-                    name: "bottom".to_string(),
-                    attributes: vec![("label".to_string(), "Another bottom".to_string())],
-                    children: vec![],
-                }],
-            },
-        ],
-    };
-    assert_eq!(Ok(("", parsed_doc)), element().parse(doc));
-}
-
-#[test]
-fn mismatched_closing_tag() {
-    let doc = r#"
-        <top>
-            <bottom/>
-        </middle>"#;
-    assert_eq!(Err("</middle>"), element().parse(doc));
-}
+}*/

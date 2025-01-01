@@ -5,7 +5,3 @@ version = 4
 [[package]]
 name = "parser_combinator"
 version = "0.1.0"
-
-[[package]]
-name = "proc"
-version = "0.1.0"
